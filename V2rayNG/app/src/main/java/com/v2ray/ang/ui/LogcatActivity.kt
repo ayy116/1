@@ -19,17 +19,37 @@ import kotlinx.coroutines.withContext
 import java.io.IOException
 
 class LogcatActivity : BaseActivity() {
-    private val binding by lazy {
-        ActivityLogcatBinding.inflate(layoutInflater)
-    }
+    private val binding by lazy { ActivityLogcatBinding.inflate(layoutInflater) }
+    private val debounceManager = DebounceManager()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(binding.root)
-
         title = getString(R.string.title_logcat)
-
         logcat(false)
+    }
+
+    class DebounceManager {
+        private val debounceMap = mutableMapOf<String, Long>()
+        private const val DEBOUNCE_DURATION = 5000L
+
+        @Synchronized
+        fun shouldProcess(key: String): Boolean {
+            val currentTime = System.currentTimeMillis()
+            val lastProcessTime = debounceMap[key] ?: 0L
+
+            return if (currentTime - lastProcessTime > DEBOUNCE_DURATION) {
+                debounceMap[key] = currentTime
+                true
+            } else {
+                false
+            }
+        }
+
+        @Synchronized
+        fun reset(key: String) {
+            debounceMap.remove(key)
+        }
     }
 
     private fun logcat(shouldFlushLog: Boolean) {
@@ -44,20 +64,26 @@ class LogcatActivity : BaseActivity() {
                         process.waitFor()
                     }
                 }
-                val lst = linkedSetOf(
-                    "logcat", "-d", "-v", "time", "-s",
-                    "GoLog,tun2socks,$ANG_PACKAGE,AndroidRuntime,System.err"
+
+                val logTags = listOf(
+                    "GoLog", "tun2socks", ANG_PACKAGE, "AndroidRuntime", "System.err"
                 )
+
+                val lst = linkedSetOf(
+                    "logcat", "-d", "-v", "time", "-s", logTags.joinToString(",")
+                )
+
                 val process = withContext(Dispatchers.IO) {
                     Runtime.getRuntime().exec(lst.toTypedArray())
                 }
-                val allText = process.inputStream.bufferedReader().use { it.readText() }
+
+                val allLogs = process.inputStream.bufferedReader().use { it.readLines() }
+                val filteredLogs = processLogs(allLogs)
+
                 withContext(Dispatchers.Main) {
-                    binding.tvLogcat.text = allText
-                    binding.tvLogcat.movementMethod = ScrollingMovementMethod()
-                    binding.pbWaiting.visibility = View.GONE
-                    Handler(Looper.getMainLooper()).post { binding.svLogcat.fullScroll(View.FOCUS_DOWN) }
+                    updateLogDisplay(filteredLogs)
                 }
+
             } catch (e: IOException) {
                 withContext(Dispatchers.Main) {
                     binding.pbWaiting.visibility = View.GONE
@@ -68,6 +94,36 @@ class LogcatActivity : BaseActivity() {
         }
     }
 
+    private fun processLogs(logs: List<String>): List<String> {
+        val processedLogs = mutableListOf<String>()
+        var notFoundLogged = false
+
+        for (line in logs) {
+            when {
+                line.contains("NotFoundException", ignoreCase = true) -> {
+                    if (!notFoundLogged) {
+                        if (debounceManager.shouldProcess("NotFoundException")) {
+                            processedLogs.add(line)
+                            notFoundLogged = true
+                        }
+                    }
+                }
+                else -> processedLogs.add(line)
+            }
+        }
+
+        return processedLogs.take(500)
+    }
+
+    private fun updateLogDisplay(logs: List<String>) {  
+        binding.tvLogcat.text = logs.joinToString("\n")
+        binding.tvLogcat.movementMethod = ScrollingMovementMethod()
+        binding.pbWaiting.visibility = View.GONE
+
+        Handler(Looper.getMainLooper()).post {
+            binding.svLogcat.fullScroll(View.FOCUS_DOWN)
+        }
+    }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menuInflater.inflate(R.menu.menu_logcat, menu)
@@ -80,12 +136,11 @@ class LogcatActivity : BaseActivity() {
             toast(R.string.toast_success)
             true
         }
-
         R.id.clear_all -> {
+            debounceManager.reset("NotFoundException")
             logcat(true)
             true
         }
-
         else -> super.onOptionsItemSelected(item)
     }
 }
